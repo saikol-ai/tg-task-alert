@@ -1,0 +1,15 @@
+# Secrets — these must never leave your PC
+settings_local.py
+google_calendar_key.json
+*.session
+*.session-journal
+session_string.txt
+state.json
+
+# Local noise
+status.log
+out.log
+err.log
+images/
+__pycache__/
+task-watcher-startup.vbs
