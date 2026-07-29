@@ -22,19 +22,29 @@ from telethon.tl.functions.messages import GetForumTopicsRequest
 from watch_tasks import (API_ID, API_HASH, WATCH, load_state, log, send_alert)
 
 SEEN_FILE = Path(__file__).with_name("last_seen.json")
+# What the watcher on the laptop has already handled, so we don't repeat it
+LOCAL_SEEN_FILE = Path(__file__).with_name("local_seen.json")
 
 # Never fire off more than this many alerts in one run (stops a surprise
 # flood if the state file is ever lost)
 MAX_PER_TOPIC = 3
 
 
-def load_seen() -> dict:
-    if SEEN_FILE.exists():
+def _read(path: Path) -> dict:
+    if path.exists():
         try:
-            return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
+
+
+def load_seen() -> dict:
+    """Furthest point either watcher has reached, per topic."""
+    seen = _read(SEEN_FILE)
+    for slot, msg_id in _read(LOCAL_SEEN_FILE).items():
+        seen[slot] = max(seen.get(slot, 0), msg_id)
+    return seen
 
 
 def save_seen(seen: dict) -> None:

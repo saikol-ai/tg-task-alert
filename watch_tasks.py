@@ -564,6 +564,46 @@ async def build_alert(text: str, group_key: str, topic_title: str) -> str:
     return "\n\n".join(blocks)
 
 
+LOCAL_SEEN_FILE = Path(__file__).with_name("local_seen.json")
+
+
+def record_handled(group_key: str, topic_title: str, msg_id: int) -> None:
+    """Tell the cloud copy this post is already dealt with.
+
+    Both watchers run at once — this one instantly, the GitHub one every few
+    minutes. Without this you'd get every alert twice and duplicate calendar
+    entries. We publish our position to a file of our own, so the two never
+    fight over the same file.
+    """
+    import subprocess
+    try:
+        seen = {}
+        if LOCAL_SEEN_FILE.exists():
+            seen = json.loads(LOCAL_SEEN_FILE.read_text(encoding="utf-8"))
+        slot = f"{group_key}::{topic_title}"
+        if msg_id <= seen.get(slot, 0):
+            return
+        seen[slot] = msg_id
+        LOCAL_SEEN_FILE.write_text(json.dumps(seen, indent=2), encoding="utf-8")
+
+        here = str(Path(__file__).parent)
+
+        def run(*args):
+            return subprocess.run(args, cwd=here, timeout=90,
+                                  capture_output=True)
+
+        run("git", "pull", "--rebase", "--autostash", "-q")
+        run("git", "add", "local_seen.json")
+        run("git", "-c", "user.name=task-watcher",
+            "-c", "user.email=task-watcher@users.noreply.github.com",
+            "commit", "-q", "-m", "handled locally")
+        pushed = run("git", "push", "-q")
+        if pushed.returncode != 0:
+            log("Could not reach the cloud copy — it may repeat this alert.")
+    except Exception as e:
+        log(f"Could not record position: {e}")
+
+
 async def send_alert(client, chat_id: int, message, group_key: str,
                      topic_title: str, prefix: str = "") -> None:
     """Send one post's alert: its image (if any), then the full details."""
@@ -671,6 +711,9 @@ async def main() -> None:
             return
         group_key, topic_title = topic_hit
         await send_alert(client, chat_id, event.message, group_key, topic_title)
+        # Stop the cloud copy repeating this alert in a few minutes' time
+        await asyncio.to_thread(record_handled, group_key, topic_title,
+                                event.message.id)
 
     await client.run_until_disconnected()
 
