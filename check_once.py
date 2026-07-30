@@ -20,6 +20,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest
 
 from watch_tasks import (API_ID, API_HASH, WATCH, load_state, log, send_alert,
+                         send_loose_attachment, has_attachment,
                          _calendar_credentials)
 
 SEEN_FILE = Path(__file__).with_name("last_seen.json")
@@ -107,7 +108,9 @@ async def main() -> None:
                     entity, limit=20, reply_to=topic.id):
                 if msg.id <= last_id:
                     break
-                if (msg.message or "").strip():
+                # Keep textless posts too when they carry a file — guidelines
+                # are often posted on their own right after the task
+                if (msg.message or "").strip() or has_attachment(msg):
                     fresh.append(msg)
 
             if not fresh:
@@ -121,12 +124,21 @@ async def main() -> None:
                 log(f"first run — starting from id {newest} in {title}")
                 continue
 
-            for msg in list(reversed(fresh))[-MAX_PER_TOPIC:]:
-                await send_alert(client, chat_id, msg, key, title)
+            batch = list(reversed(fresh))[-MAX_PER_TOPIC:]
+            forwarded = set()
+            for msg in batch:
+                if (msg.message or "").strip():
+                    forwarded |= await send_alert(
+                        client, chat_id, msg, key, title,
+                        already_sent=forwarded)
+                elif msg.id not in forwarded:
+                    # A file on its own — pair it with the task above it
+                    forwarded.add(msg.id)
+                    await send_loose_attachment(client, chat_id, msg, title)
                 sent += 1
                 await asyncio.sleep(1)
             seen[slot] = newest
-            log(f"sent {len(fresh)} alert(s) for {title}")
+            log(f"sent {len(batch)} alert(s) for {title}")
 
     save_seen(seen)
     log(f"run complete — {sent} alert(s) sent")

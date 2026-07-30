@@ -333,16 +333,29 @@ def split_for_telegram(text: str, limit: int = 3800) -> list:
 
 def notify_photo(chat_id: int, path: str, caption: str = "") -> bool:
     """Send an image the task came with."""
+    return _send_file(chat_id, path, caption, "sendPhoto", "photo")
+
+
+def notify_document(chat_id: int, path: str, caption: str = "") -> bool:
+    """Send a file the task came with (PDF, spreadsheet, image-as-file...)."""
+    return _send_file(chat_id, path, caption, "sendDocument", "document")
+
+
+def _send_file(chat_id: int, path: str, caption: str,
+               method: str, field: str) -> bool:
     try:
         with open(path, "rb") as f:
             r = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
                 data={"chat_id": chat_id, "caption": caption[:1000]},
-                files={"photo": f}, timeout=120,
+                files={field: f}, timeout=300,
             )
-        return bool(r.json().get("ok"))
+        ok = bool(r.json().get("ok"))
+        if not ok:
+            log(f"{method} refused: {r.text[:200]}")
+        return ok
     except Exception as e:
-        log(f"Could not send image: {e}")
+        log(f"Could not send attachment: {e}")
         return False
 
 
@@ -704,25 +717,43 @@ def record_handled(group_key: str, topic_title: str, msg_id: int) -> None:
         log(f"Could not record position: {e}")
 
 
-def has_real_image(message) -> bool:
-    """True only for an image genuinely attached to the post.
+MAX_UPLOAD = 45 * 1024 * 1024   # Telegram bots can't send more than ~50MB
 
-    Telegram also reports the little thumbnail it generates for a link
-    preview as a "photo". Those aren't attachments — the picture lives on
-    the linked page — so forwarding them was misleading.
+
+def is_photo_media(message) -> bool:
+    """A compressed photo, which Telegram shows inline."""
+    return isinstance(getattr(message, "media", None), MessageMediaPhoto)
+
+
+def attachment_info(message) -> tuple:
+    """(filename, size) for a file attachment, or (None, 0)."""
+    media = getattr(message, "media", None)
+    if not isinstance(media, MessageMediaDocument):
+        return None, 0
+    doc = getattr(media, "document", None)
+    if doc is None:
+        return None, 0
+    name = None
+    for attr in getattr(doc, "attributes", []) or []:
+        name = getattr(attr, "file_name", None) or name
+    return name, getattr(doc, "size", 0) or 0
+
+
+def has_attachment(message) -> bool:
+    """True for anything genuinely attached — a photo, or any file.
+
+    Guidelines and briefs often arrive as a document (a .jpg sent "as file",
+    a PDF, a spreadsheet), sometimes in a separate message right after the
+    task. Link-preview thumbnails are excluded: Telegram reports those as
+    photos, but the picture actually lives on the linked page.
     """
     media = getattr(message, "media", None)
-    if isinstance(media, MessageMediaPhoto):
-        return True
-    if isinstance(media, MessageMediaDocument):
-        mime = getattr(getattr(media, "document", None), "mime_type", "") or ""
-        return mime.startswith("image/")
-    return False
+    return isinstance(media, (MessageMediaPhoto, MessageMediaDocument))
 
 
-async def collect_images(client, message) -> list:
-    """Every genuinely attached image, including the rest of an album."""
-    found = [message] if has_real_image(message) else []
+async def collect_attachments(client, message) -> list:
+    """Everything attached to this post, including the rest of an album."""
+    found = [message] if has_attachment(message) else []
     group_id = getattr(message, "grouped_id", None)
     if group_id:
         try:
@@ -731,37 +762,89 @@ async def collect_images(client, message) -> list:
                 ids=list(range(message.id - 9, message.id + 10)))
             found = [m for m in nearby
                      if m and getattr(m, "grouped_id", None) == group_id
-                     and has_real_image(m)]
+                     and has_attachment(m)]
             found.sort(key=lambda m: m.id)
         except Exception as e:
             log(f"Could not read the rest of the album: {e}")
     return found
 
 
+async def forward_attachment(client, chat_id: int, message, label: str,
+                             counter: str = "") -> None:
+    """Download one attachment and pass it on, photo or file."""
+    name, size = attachment_info(message)
+    if size and size > MAX_UPLOAD:
+        mb = size / 1024 / 1024
+        notify(chat_id, f"📎 <b>{html.escape(name or 'File')}</b> "
+                        f"({mb:.0f} MB) is attached to this task, but it's too "
+                        f"big for me to forward — open it in Telegram.",
+               use_html=True)
+        return
+
+    tmp = Path(TEMP_DIR) / f"att_{message.id}_{name or 'photo.jpg'}"
+    try:
+        await client.download_media(message, file=str(tmp))
+        if not tmp.exists():
+            return
+        caption = f"📎 Attached to: {label}{counter}"
+        if is_photo_media(message):
+            await asyncio.to_thread(notify_photo, chat_id, str(tmp), caption)
+        else:
+            if name:
+                caption += f"\n🗂 {name}"
+            await asyncio.to_thread(notify_document, chat_id, str(tmp), caption)
+    except Exception as e:
+        log(f"Attachment download failed: {e}")
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 async def send_alert(client, chat_id: int, message, group_key: str,
-                     topic_title: str, prefix: str = "") -> None:
-    """Send one post's alert: its attached image(s), then the full details."""
+                     topic_title: str, prefix: str = "",
+                     already_sent: set | None = None) -> set:
+    """Send one post's alert: its attachments, then the full details.
+
+    Returns the ids of the attachments sent, so a follow-up message that
+    carries the same file isn't forwarded twice.
+    """
     text = message_text(message)
     alert = prefix + await build_alert(text, group_key, topic_title)
 
-    images = await collect_images(client, message)
-    for n, img in enumerate(images, start=1):
-        tmp = Path(TEMP_DIR) / f"task_{img.id}.jpg"
-        try:
-            await client.download_media(img, file=str(tmp))
-            if not tmp.exists():
-                continue
-            first = next((l for l in text.splitlines() if l.strip()), "")
-            label = clean_title(first)[:140] or topic_title
-            count = f" ({n} of {len(images)})" if len(images) > 1 else ""
-            await asyncio.to_thread(
-                notify_photo, chat_id, str(tmp),
-                f"📎 Attached to: {label}{count}")
-            tmp.unlink(missing_ok=True)
-        except Exception as e:
-            log(f"Image download failed: {e}")
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    label = clean_title(first)[:140] or topic_title
+
+    files = await collect_attachments(client, message)
+    if already_sent:
+        files = [m for m in files if m.id not in already_sent]
+    sent = set()
+    for n, att in enumerate(files, start=1):
+        counter = f" ({n} of {len(files)})" if len(files) > 1 else ""
+        await forward_attachment(client, chat_id, att, label, counter)
+        sent.add(att.id)
 
     notify(chat_id, alert, use_html=True)
+    return sent
+
+
+async def send_loose_attachment(client, chat_id: int, message,
+                                topic_title: str) -> None:
+    """A file posted on its own, just after the task it belongs to."""
+    label = topic_title
+    try:
+        recent = await client.get_messages(
+            message.peer_id, ids=list(range(message.id - 6, message.id)))
+        for prev in sorted([m for m in recent if m], key=lambda m: -m.id):
+            if (prev.message or "").strip():
+                label = clean_title(next(
+                    l for l in prev.message.splitlines() if l.strip()))[:140]
+                break
+    except Exception as e:
+        log(f"Could not find which task the file belongs to: {e}")
+    await forward_attachment(client, chat_id, message, label,
+                             " (posted separately)")
 
 
 async def main() -> None:
@@ -780,6 +863,9 @@ async def main() -> None:
 
     client = TelegramClient(SESSION, API_ID, API_HASH)
     await client.start()
+
+    # Attachments already passed on, so an album extra isn't sent twice
+    forwarded = set()
 
     # Find each group by (partial) title. Only groups that use topics can
     # be watched, and a similarly-named ordinary chat would break us.
@@ -854,11 +940,21 @@ async def main() -> None:
         if topic_hit is None:
             return
         group_key, topic_title = topic_hit
-        # An album arrives as several messages but only one carries the text —
-        # skip the extras, their images are gathered with the captioned one
-        if not (event.message.message or "").strip():
+        msg = event.message
+
+        if not (msg.message or "").strip():
+            # No text. Either an album extra (already forwarded with the
+            # captioned post) or a file posted on its own after the task.
+            if has_attachment(msg) and msg.id not in forwarded:
+                forwarded.add(msg.id)
+                await send_loose_attachment(client, chat_id, msg, topic_title)
             return
-        await send_alert(client, chat_id, event.message, group_key, topic_title)
+
+        sent = await send_alert(client, chat_id, msg, group_key, topic_title,
+                                already_sent=forwarded)
+        forwarded.update(sent)
+        # Stop the cloud copy repeating this alert in a few minutes' time
+        await asyncio.to_thread(record_handled, group_key, topic_title, msg.id)
         # Stop the cloud copy repeating this alert in a few minutes' time
         await asyncio.to_thread(record_handled, group_key, topic_title,
                                 event.message.id)
