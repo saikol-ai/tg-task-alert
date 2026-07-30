@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from telethon import TelegramClient, events, utils
 from telethon.tl.functions.messages import GetForumTopicsRequest
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
 # ----------------------- SETTINGS -----------------------
 
@@ -95,6 +96,9 @@ def log(msg: str) -> None:
 
 
 URL_RE = r"https?://[^\s)>\]]+"
+
+# Visual break between the task's own words and the bits I add
+DIVIDER = "━━━━━━━━━━━━━━━━━━"
 
 # Links that are forms/submissions, not content worth previewing
 SKIP_PREVIEW = ("forms.gle", "docs.google.com/forms", "tinyurl.com", "t.me/",
@@ -501,24 +505,27 @@ async def build_alert(text: str, group_key: str, topic_title: str) -> str:
         title = clean_title(first_line) or f"Activity — {group_key}"
         start = parse_event_time(text)
         join = next((u for u in re.findall(URL_RE, text)), "")
+        event_lines = []
         if start:
             shown = (start + timedelta(hours=LOCAL_UTC_OFFSET)).strftime(
                 "%a %d %b %Y, %I:%M %p")
             added = await asyncio.to_thread(
                 create_calendar_event, title, start, text, join)
             if added:
-                blocks.append(f"✅ Added to your Google Calendar\n{shown} (PHT)")
+                event_lines.append(
+                    f"✅ Added to your Google Calendar\n{shown} (PHT)")
             else:
                 cal = calendar_link(title, start, details=text, location=join)
-                blocks.append(
+                event_lines.append(
                     f'🗓 <a href="{html.escape(cal)}">Add to Google Calendar</a>\n'
                     f"Detected: {shown} (PHT) — check it before saving"
                 )
         else:
-            blocks.append("🗓 No clear date/time found — add it manually if "
-                          "this is an event.")
+            event_lines.append("🗓 No clear date/time found — add it manually "
+                               "if this is an event.")
         if join:
-            blocks.append(f"🔗 Join link: {html.escape(join)}")
+            event_lines.append(f"🔗 Join link: {html.escape(join)}")
+        blocks.append(DIVIDER + "\n" + "\n\n".join(event_lines))
         return "\n\n".join(blocks)
 
     links = categorize_links(text)
@@ -546,7 +553,8 @@ async def build_alert(text: str, group_key: str, topic_title: str) -> str:
     for u in links["submit"]:
         link_lines.append(f"📋 Submit here after posting: {html.escape(u)}")
     if link_lines:
-        blocks.append("🔗 Key links:\n" + "\n".join(link_lines))
+        blocks.append(DIVIDER + "\n🔗 <b>Key links</b>\n"
+                      + "\n".join(link_lines))
 
     # Only preview genuine "read this first" material, not the press release
     report = next((u for u in links["read"]
@@ -559,7 +567,7 @@ async def build_alert(text: str, group_key: str, topic_title: str) -> str:
             if preview:
                 preview = "📖 Quick skim of the report:\n" + preview
         if preview:
-            blocks.append(html.escape(preview))
+            blocks.append(DIVIDER + "\n" + html.escape(preview))
 
     return "\n\n".join(blocks)
 
@@ -604,23 +612,60 @@ def record_handled(group_key: str, topic_title: str, msg_id: int) -> None:
         log(f"Could not record position: {e}")
 
 
+def has_real_image(message) -> bool:
+    """True only for an image genuinely attached to the post.
+
+    Telegram also reports the little thumbnail it generates for a link
+    preview as a "photo". Those aren't attachments — the picture lives on
+    the linked page — so forwarding them was misleading.
+    """
+    media = getattr(message, "media", None)
+    if isinstance(media, MessageMediaPhoto):
+        return True
+    if isinstance(media, MessageMediaDocument):
+        mime = getattr(getattr(media, "document", None), "mime_type", "") or ""
+        return mime.startswith("image/")
+    return False
+
+
+async def collect_images(client, message) -> list:
+    """Every genuinely attached image, including the rest of an album."""
+    found = [message] if has_real_image(message) else []
+    group_id = getattr(message, "grouped_id", None)
+    if group_id:
+        try:
+            nearby = await client.get_messages(
+                message.peer_id,
+                ids=list(range(message.id - 9, message.id + 10)))
+            found = [m for m in nearby
+                     if m and getattr(m, "grouped_id", None) == group_id
+                     and has_real_image(m)]
+            found.sort(key=lambda m: m.id)
+        except Exception as e:
+            log(f"Could not read the rest of the album: {e}")
+    return found
+
+
 async def send_alert(client, chat_id: int, message, group_key: str,
                      topic_title: str, prefix: str = "") -> None:
-    """Send one post's alert: its image (if any), then the full details."""
+    """Send one post's alert: its attached image(s), then the full details."""
     text = message_text(message)
     alert = prefix + await build_alert(text, group_key, topic_title)
 
-    # If the task came with an image (poster, brief, guideline), send it too
-    if getattr(message, "photo", None):
-        tmp = Path(TEMP_DIR) / f"task_{message.id}.jpg"
+    images = await collect_images(client, message)
+    for n, img in enumerate(images, start=1):
+        tmp = Path(TEMP_DIR) / f"task_{img.id}.jpg"
         try:
-            await client.download_media(message, file=str(tmp))
-            if tmp.exists():
-                first = next((l for l in text.splitlines() if l.strip()), "")
-                await asyncio.to_thread(
-                    notify_photo, chat_id, str(tmp),
-                    f"📎 Image attached to: {clean_title(first)[:150]}")
-                tmp.unlink(missing_ok=True)
+            await client.download_media(img, file=str(tmp))
+            if not tmp.exists():
+                continue
+            first = next((l for l in text.splitlines() if l.strip()), "")
+            label = clean_title(first)[:140] or topic_title
+            count = f" ({n} of {len(images)})" if len(images) > 1 else ""
+            await asyncio.to_thread(
+                notify_photo, chat_id, str(tmp),
+                f"📎 Attached to: {label}{count}")
+            tmp.unlink(missing_ok=True)
         except Exception as e:
             log(f"Image download failed: {e}")
 
@@ -644,11 +689,13 @@ async def main() -> None:
     client = TelegramClient(SESSION, API_ID, API_HASH)
     await client.start()
 
-    # Find each group by (partial) title
+    # Find each group by (partial) title. Only groups that use topics can
+    # be watched, and a similarly-named ordinary chat would break us.
     groups = {}  # watch-key -> entity
     async for dialog in client.iter_dialogs():
         for key in WATCH:
-            if key.lower() in (dialog.name or "").lower():
+            if (key.lower() in (dialog.name or "").lower()
+                    and getattr(dialog.entity, "forum", False)):
                 groups.setdefault(key, dialog.entity)
     for k in [k for k in WATCH if k not in groups]:
         log(f'WARNING: could not find a group matching "{k}" — skipping it.')
@@ -661,11 +708,16 @@ async def main() -> None:
     entities = []
     watched_labels = []
     for key, entity in groups.items():
-        topics = await client(
-            GetForumTopicsRequest(
-                peer=entity, offset_date=None, offset_id=0, offset_topic=0, limit=100
+        try:
+            topics = await client(
+                GetForumTopicsRequest(
+                    peer=entity, offset_date=None, offset_id=0,
+                    offset_topic=0, limit=100
+                )
             )
-        )
+        except Exception as e:
+            log(f'Could not read topics in "{key}" ({e}) — skipping it.')
+            continue
         found = {}
         for topic in topics.topics:
             title = getattr(topic, "title", "") or ""
@@ -710,6 +762,10 @@ async def main() -> None:
         if topic_hit is None:
             return
         group_key, topic_title = topic_hit
+        # An album arrives as several messages but only one carries the text —
+        # skip the extras, their images are gathered with the captioned one
+        if not (event.message.message or "").strip():
+            return
         await send_alert(client, chat_id, event.message, group_key, topic_title)
         # Stop the cloud copy repeating this alert in a few minutes' time
         await asyncio.to_thread(record_handled, group_key, topic_title,

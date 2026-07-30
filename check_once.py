@@ -73,13 +73,18 @@ async def main() -> None:
     groups = {}
     async for dialog in client.iter_dialogs():
         for key in WATCH:
-            if key.lower() in (dialog.name or "").lower():
+            if (key.lower() in (dialog.name or "").lower()
+                    and getattr(dialog.entity, "forum", False)):
                 groups.setdefault(key, dialog.entity)
 
     for key, entity in groups.items():
-        topics = await client(GetForumTopicsRequest(
-            peer=entity, offset_date=None, offset_id=0,
-            offset_topic=0, limit=100))
+        try:
+            topics = await client(GetForumTopicsRequest(
+                peer=entity, offset_date=None, offset_id=0,
+                offset_topic=0, limit=100))
+        except Exception as e:
+            log(f'Could not read topics in "{key}" ({e}) — skipping it.')
+            continue
         for topic in topics.topics:
             title = getattr(topic, "title", "") or ""
             if not any(w.lower() in title.lower() for w in WATCH[key]):
