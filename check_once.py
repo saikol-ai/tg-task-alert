@@ -19,7 +19,8 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest
 
-from watch_tasks import (API_ID, API_HASH, WATCH, load_state, log, send_alert)
+from watch_tasks import (API_ID, API_HASH, WATCH, load_state, log, send_alert,
+                         _calendar_credentials)
 
 SEEN_FILE = Path(__file__).with_name("last_seen.json")
 # What the watcher on the laptop has already handled, so we don't repeat it
@@ -57,6 +58,14 @@ async def main() -> None:
         log("No CHAT_ID — cannot send alerts.")
         sys.exit(1)
     chat_id = int(chat_id)
+
+    # Report the calendar key's health every run. A broken key used to fail
+    # quietly, dropping events without anyone noticing.
+    try:
+        log("calendar key: "
+            + ("ok" if _calendar_credentials() else "not configured"))
+    except Exception as e:
+        log(f"calendar key PROBLEM — events will not be saved: {e}")
 
     session_str = os.environ.get("TG_SESSION")
     if session_str:
