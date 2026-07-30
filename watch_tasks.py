@@ -126,35 +126,57 @@ def clean_title(line: str) -> str:
     return EMOJI_RE.sub("", line).strip(" -–—:•|!").strip()
 
 
-def parse_event_time(text: str) -> datetime | None:
-    """Find the event's start time and return it in UTC."""
-    date_m = DATE_RE.search(text)
-    if not date_m:
-        return None
-    month = MONTHS[date_m.group(1).lower()]
-    day = int(date_m.group(2))
-    year = int(date_m.group(3)) if date_m.group(3) else datetime.now().year
+def _date_parts(m) -> tuple:
+    return (int(m.group(3)) if m.group(3) else datetime.now().year,
+            MONTHS[m.group(1).lower()], int(m.group(2)))
 
-    # Prefer a time stated after the date, else anywhere in the message
-    tail = text[date_m.end():]
-    t = TIME_AMPM_RE.search(tail) or TIME_AMPM_RE.search(text)
-    if t:
+
+def parse_event_time(text: str) -> datetime | None:
+    """Find when the event actually starts, and return it in UTC.
+
+    A post often carries several dates — a campaign that runs one week, an
+    orientation call on another day. The time belongs to whichever date it
+    sits closest to (same line first), not simply the first date in the post.
+    """
+    dates = list(DATE_RE.finditer(text))
+    if not dates:
+        return None
+    times = [(m, True) for m in TIME_AMPM_RE.finditer(text)]
+    if not times:
+        times = [(m, False) for m in TIME_24_RE.finditer(text)]
+    if not times:
+        return None
+
+    best = None  # (score, date match, time match, is_ampm)
+    for d in dates:
+        for t, is_ampm in times:
+            if t.start() >= d.end():
+                between, gap = text[d.end():t.start()], t.start() - d.end()
+            elif d.start() >= t.end():
+                between, gap = text[t.end():d.start()], d.start() - t.end()
+            else:
+                continue  # they overlap, ignore
+            score = (0 if "\n" not in between else 1, gap)
+            if best is None or score < best[0]:
+                best = (score, d, t, is_ampm)
+    if best is None:
+        return None
+    _, date_m, t, is_ampm = best
+
+    if is_ampm:
         hour = int(t.group(1)) % 12
         minute = int(t.group(2) or 0)
         if t.group(3).lower() == "p":
             hour += 12
-        zone_src = tail
     else:
-        t = TIME_24_RE.search(tail) or TIME_24_RE.search(text)
-        if not t:
-            return None
         hour, minute = int(t.group(1)), int(t.group(2))
-        zone_src = tail
 
-    zone_m = ZONE_RE.search(zone_src) or ZONE_RE.search(text)
-    zone = (zone_m.group(1).upper() if zone_m else "")
+    zone_m = (ZONE_RE.search(text[t.end():t.end() + 20])
+              or ZONE_RE.search(text))
+    zone = zone_m.group(1).upper() if zone_m else ""
     offset = 0 if zone in ("UTC", "GMT") else LOCAL_UTC_OFFSET
 
+    year, month, day = _date_parts(date_m)
     try:
         local = datetime(year, month, day, hour, minute)
     except ValueError:
@@ -168,6 +190,47 @@ def parse_event_time(text: str) -> datetime | None:
     return start_utc
 
 
+def parse_date_range(text: str) -> tuple | None:
+    """A multi-day span like 'Duration: July 31, 2026 - August 6, 2026'."""
+    for line in text.splitlines():
+        if not re.search(r"duration|runs?\s+from|campaign period|from\b", line,
+                         re.I):
+            continue
+        found = list(DATE_RE.finditer(line))
+        if len(found) < 2:
+            continue
+        try:
+            a = datetime(*_date_parts(found[0]))
+            b = datetime(*_date_parts(found[1]))
+        except ValueError:
+            continue
+        if b >= a:
+            return a.date(), b.date()
+    return None
+
+
+def _calendar_credentials():
+    """Load the Google key, whether it's a file here or a setting in the cloud.
+
+    utf-8-sig and the lstrip below handle the invisible byte marker some tools
+    prepend, which otherwise makes the key unreadable.
+    """
+    try:
+        from google.oauth2 import service_account
+    except ImportError:
+        return None
+    env_key = os.environ.get("GOOGLE_KEY")
+    key_file = Path(__file__).with_name("google_calendar_key.json")
+    if env_key:
+        info = json.loads(env_key.lstrip("﻿"))
+    elif key_file.exists():
+        info = json.loads(key_file.read_text(encoding="utf-8-sig"))
+    else:
+        return None
+    return service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/calendar"])
+
+
 def create_calendar_event(title: str, start_utc: datetime, details: str = "",
                           location: str = "", hours: int = 2) -> bool:
     """Write the event straight into Google Calendar.
@@ -177,19 +240,11 @@ def create_calendar_event(title: str, start_utc: datetime, details: str = "",
     Returns False if that isn't set up — the alert then falls back to a
     one-tap 'add to calendar' link.
     """
-    key_file = Path(__file__).with_name("google_calendar_key.json")
-    if not key_file.exists():
-        # In the cloud the key arrives as a secure setting instead of a file
-        env_key = os.environ.get("GOOGLE_KEY")
-        if not env_key:
-            return False
-        key_file.write_text(env_key, encoding="utf-8")
     try:
-        from google.oauth2 import service_account
         from googleapiclient.discovery import build as gbuild
-
-        creds = service_account.Credentials.from_service_account_file(
-            str(key_file), scopes=["https://www.googleapis.com/auth/calendar"])
+        creds = _calendar_credentials()
+        if creds is None:
+            return False
         service = gbuild("calendar", "v3", credentials=creds,
                          cache_discovery=False)
         body = {
@@ -208,6 +263,32 @@ def create_calendar_event(title: str, start_utc: datetime, details: str = "",
         return True
     except Exception as e:
         log(f"Calendar add failed ({e}) — falling back to a tap link.")
+        return False
+
+
+def create_all_day_event(title: str, first_day, last_day,
+                         details: str = "") -> bool:
+    """Block out a multi-day campaign, e.g. a week-long challenge."""
+    try:
+        from googleapiclient.discovery import build as gbuild
+        creds = _calendar_credentials()
+        if creds is None:
+            return False
+        service = gbuild("calendar", "v3", credentials=creds,
+                         cache_discovery=False)
+        service.events().insert(calendarId=CALENDAR_ID, body={
+            "summary": title[:200],
+            "description": details[:2000],
+            # Google treats the end date as exclusive
+            "start": {"date": first_day.isoformat()},
+            "end": {"date": (last_day + timedelta(days=1)).isoformat()},
+            "reminders": {"useDefault": False, "overrides": [
+                {"method": "popup", "minutes": 12 * 60},
+            ]},
+        }).execute()
+        return True
+    except Exception as e:
+        log(f"Could not add the campaign dates ({e}).")
         return False
 
 
@@ -523,6 +604,17 @@ async def build_alert(text: str, group_key: str, topic_title: str) -> str:
         else:
             event_lines.append("🗓 No clear date/time found — add it manually "
                                "if this is an event.")
+
+        # Some posts also run over several days (a week-long challenge)
+        span = parse_date_range(text)
+        if span:
+            first, last = span
+            if await asyncio.to_thread(create_all_day_event, title, first,
+                                       last, text):
+                event_lines.append(
+                    f"📆 Also blocked out {first:%d %b} – {last:%d %b} "
+                    "in your calendar (runs all week)")
+
         if join:
             event_lines.append(f"🔗 Join link: {html.escape(join)}")
         blocks.append(DIVIDER + "\n" + "\n\n".join(event_lines))
