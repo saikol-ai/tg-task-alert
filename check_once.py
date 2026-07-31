@@ -124,21 +124,34 @@ async def main() -> None:
                 log(f"first run — starting from id {newest} in {title}")
                 continue
 
-            batch = list(reversed(fresh))[-MAX_PER_TOPIC:]
+            # Cap how many *tasks* go out at once, not how many messages —
+            # a five-image album is five messages but only one task, and
+            # counting messages would crowd the task's own text out.
+            in_order = sorted(fresh, key=lambda m: m.id)
+            task_posts = [m for m in in_order if (m.message or "").strip()]
+            keep = {m.id for m in task_posts[-MAX_PER_TOPIC:]}
+            floor = min(keep) if keep else 0
+            batch = [m for m in in_order
+                     if m.id in keep
+                     or (not (m.message or "").strip() and m.id >= floor)]
             forwarded = set()
             for msg in batch:
                 if (msg.message or "").strip():
                     forwarded |= await send_alert(
                         client, chat_id, msg, key, title,
                         already_sent=forwarded)
+                    sent += 1
                 elif msg.id not in forwarded:
                     # A file on its own — pair it with the task above it
                     forwarded.add(msg.id)
-                    await send_loose_attachment(client, chat_id, msg, title)
-                sent += 1
+                    forwarded |= await send_loose_attachment(
+                        client, chat_id, msg, title)
+                    sent += 1
+                else:
+                    continue  # already went out with its album
                 await asyncio.sleep(1)
             seen[slot] = newest
-            log(f"sent {len(batch)} alert(s) for {title}")
+            log(f"sent {len(keep)} task(s) for {title}")
 
     save_seen(seen)
     log(f"run complete — {sent} alert(s) sent")

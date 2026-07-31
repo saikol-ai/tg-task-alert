@@ -341,6 +341,44 @@ def notify_document(chat_id: int, path: str, caption: str = "") -> bool:
     return _send_file(chat_id, path, caption, "sendDocument", "document")
 
 
+def notify_media_group(chat_id: int, items: list, caption: str = "") -> bool:
+    """Send several attachments as one album, in order.
+
+    Telegram groups 2-10 items per album, and won't mix photos with files,
+    so callers pass one batch of a single kind at a time.
+    """
+    media, files, handles = [], {}, []
+    try:
+        for i, (path, is_photo) in enumerate(items):
+            tag = f"file{i}"
+            entry = {"type": "photo" if is_photo else "document",
+                     "media": f"attach://{tag}"}
+            if i == 0 and caption:
+                entry["caption"] = caption[:1000]
+            media.append(entry)
+            fh = open(path, "rb")
+            handles.append(fh)
+            files[tag] = fh
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMediaGroup",
+            data={"chat_id": chat_id, "media": json.dumps(media)},
+            files=files, timeout=300,
+        )
+        ok = bool(r.json().get("ok"))
+        if not ok:
+            log(f"sendMediaGroup refused: {r.text[:200]}")
+        return ok
+    except Exception as e:
+        log(f"Could not send album: {e}")
+        return False
+    finally:
+        for fh in handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 def _send_file(chat_id: int, path: str, caption: str,
                method: str, field: str) -> bool:
     try:
@@ -769,37 +807,69 @@ async def collect_attachments(client, message) -> list:
     return found
 
 
-async def forward_attachment(client, chat_id: int, message, label: str,
-                             counter: str = "") -> None:
-    """Download one attachment and pass it on, photo or file."""
-    name, size = attachment_info(message)
-    if size and size > MAX_UPLOAD:
-        mb = size / 1024 / 1024
-        notify(chat_id, f"📎 <b>{html.escape(name or 'File')}</b> "
-                        f"({mb:.0f} MB) is attached to this task, but it's too "
-                        f"big for me to forward — open it in Telegram.",
-               use_html=True)
-        return
+def _safe_name(name: str | None, msg_id: int) -> str:
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", name or "photo.jpg")
+    return f"att_{msg_id}_{base[-60:]}"
 
-    tmp = Path(TEMP_DIR) / f"att_{message.id}_{name or 'photo.jpg'}"
+
+async def forward_attachments(client, chat_id: int, messages: list,
+                              label: str, note: str = "") -> None:
+    """Pass on a post's attachments, keeping them together and in order.
+
+    Several images arrive as one album, exactly as they were posted, rather
+    than as a scatter of separate messages.
+    """
+    if not messages:
+        return
+    messages = sorted(messages, key=lambda m: m.id)
+
+    downloaded = []  # (path, is_photo)
     try:
-        await client.download_media(message, file=str(tmp))
-        if not tmp.exists():
+        for m in messages:
+            name, size = attachment_info(m)
+            if size and size > MAX_UPLOAD:
+                notify(chat_id,
+                       f"📎 <b>{html.escape(name or 'File')}</b> "
+                       f"({size / 1024 / 1024:.0f} MB) is attached to this "
+                       "task but is too big for me to forward — open it in "
+                       "Telegram.", use_html=True)
+                continue
+            tmp = Path(TEMP_DIR) / _safe_name(name, m.id)
+            try:
+                await client.download_media(m, file=str(tmp))
+                if tmp.exists():
+                    downloaded.append((tmp, is_photo_media(m)))
+            except Exception as e:
+                log(f"Attachment download failed: {e}")
+
+        if not downloaded:
             return
-        caption = f"📎 Attached to: {label}{counter}"
-        if is_photo_media(message):
-            await asyncio.to_thread(notify_photo, chat_id, str(tmp), caption)
-        else:
-            if name:
-                caption += f"\n🗂 {name}"
-            await asyncio.to_thread(notify_document, chat_id, str(tmp), caption)
-    except Exception as e:
-        log(f"Attachment download failed: {e}")
+
+        caption = f"📎 Attached to: {label}{note}"
+        if len(downloaded) > 1:
+            caption += f"\n({len(downloaded)} files, in order)"
+
+        # Photos and files can't share an album, so send each kind together
+        first = True
+        for is_photo in (True, False):
+            batch = [(str(p), ip) for p, ip in downloaded if ip is is_photo]
+            for i in range(0, len(batch), 10):
+                chunk = batch[i:i + 10]
+                cap = caption if first else ""
+                first = False
+                if len(chunk) == 1:
+                    path, ip = chunk[0]
+                    send = notify_photo if ip else notify_document
+                    await asyncio.to_thread(send, chat_id, path, cap)
+                else:
+                    await asyncio.to_thread(notify_media_group, chat_id,
+                                            chunk, cap)
     finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for path, _ in downloaded:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 async def send_alert(client, chat_id: int, message, group_key: str,
@@ -819,19 +889,15 @@ async def send_alert(client, chat_id: int, message, group_key: str,
     files = await collect_attachments(client, message)
     if already_sent:
         files = [m for m in files if m.id not in already_sent]
-    sent = set()
-    for n, att in enumerate(files, start=1):
-        counter = f" ({n} of {len(files)})" if len(files) > 1 else ""
-        await forward_attachment(client, chat_id, att, label, counter)
-        sent.add(att.id)
+    await forward_attachments(client, chat_id, files, label)
 
     notify(chat_id, alert, use_html=True)
-    return sent
+    return {m.id for m in files}
 
 
 async def send_loose_attachment(client, chat_id: int, message,
-                                topic_title: str) -> None:
-    """A file posted on its own, just after the task it belongs to."""
+                                topic_title: str) -> set:
+    """Files posted on their own, just after the task they belong to."""
     label = topic_title
     try:
         recent = await client.get_messages(
@@ -843,8 +909,14 @@ async def send_loose_attachment(client, chat_id: int, message,
                 break
     except Exception as e:
         log(f"Could not find which task the file belongs to: {e}")
-    await forward_attachment(client, chat_id, message, label,
-                             " (posted separately)")
+
+    # If it's one of several posted together, send the whole set as an album
+    group = await collect_attachments(client, message)
+    if not group:
+        group = [message]
+    await forward_attachments(client, chat_id, group, label,
+                              " (posted separately)")
+    return {m.id for m in group}
 
 
 async def main() -> None:
@@ -947,7 +1019,8 @@ async def main() -> None:
             # captioned post) or a file posted on its own after the task.
             if has_attachment(msg) and msg.id not in forwarded:
                 forwarded.add(msg.id)
-                await send_loose_attachment(client, chat_id, msg, topic_title)
+                forwarded |= await send_loose_attachment(
+                    client, chat_id, msg, topic_title)
             return
 
         sent = await send_alert(client, chat_id, msg, group_key, topic_title,
