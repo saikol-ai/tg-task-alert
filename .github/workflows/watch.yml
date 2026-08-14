@@ -1,11 +1,15 @@
 name: Task watcher
 
+# GitHub's scheduler drops most short-interval runs, so we don't rely on it
+# to drive each check. It only needs to start a run; that run then stays
+# alive for hours and checks every couple of minutes from inside.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
-  workflow_dispatch:         # lets you run it by hand from the Actions tab
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
 
-# Only one run at a time, so two runs can't send the same alert twice
+# One run at a time. While a long run is alive, the next scheduled run waits
+# its turn and starts the moment this one ends, keeping cover continuous.
 concurrency:
   group: task-watcher
   cancel-in-progress: false
@@ -16,6 +20,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +32,7 @@ jobs:
       - name: Install what it needs
         run: pip install -r cloud/requirements.txt
 
-      - name: Check for new tasks
+      - name: Watch for new tasks
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -36,9 +41,12 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
           GOOGLE_KEY: ${{ secrets.GOOGLE_KEY }}
+          LOOP_MINUTES: "330"     # stay alive 5.5 hours
+          CHECK_INTERVAL: "120"   # look every 2 minutes
         run: python check_once.py
 
       - name: Remember where it got to
+        if: always()
         run: |
           rm -f google_calendar_key.json
           git config user.name  "task-watcher"
@@ -46,6 +54,5 @@ jobs:
           git add last_seen.json
           git diff --staged --quiet && exit 0
           git commit -m "checked for new tasks"
-          # the laptop may have pushed its own position meanwhile
           git pull --rebase --autostash -q
           git push
