@@ -13,3 +13,5 @@ err.log
 images/
 __pycache__/
 task-watcher-startup.vbs
+
+cloud_session_string.txt

@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.errors import AuthKeyDuplicatedError, AuthKeyUnregisteredError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest
 
@@ -39,6 +40,20 @@ MAX_PER_TOPIC = 3
 LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES") or 0)
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL") or 120)
 IN_CLOUD = bool(os.environ.get("GITHUB_ACTIONS"))
+
+
+def telegram_alert(text: str) -> None:
+    """Tell the user directly when the watcher itself is in trouble."""
+    import requests
+    from watch_tasks import BOT_TOKEN
+    chat = os.environ.get("CHAT_ID") or load_state().get("chat_id")
+    if not (chat and BOT_TOKEN):
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      json={"chat_id": int(chat), "text": text}, timeout=30)
+    except Exception:
+        pass
 
 
 def _read(path: Path) -> dict:
@@ -202,7 +217,21 @@ async def main() -> None:
     else:  # running on your PC, reuse the normal login
         from watch_tasks import SESSION
         client = TelegramClient(SESSION, API_ID, API_HASH)
-    await client.start()
+
+    try:
+        await client.start()
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+        # The cloud must have its own sign-in. Sharing one with the laptop
+        # makes Telegram cancel it the moment both are connected at once,
+        # which silently takes down both watchers.
+        log("TELEGRAM SIGN-IN CANCELLED — the cloud needs its own separate "
+            "login. Run first_time_login.py on the laptop and update the "
+            "TG_SESSION secret. Not retrying.")
+        telegram_alert(
+            "⚠️ The cloud watcher's Telegram sign-in was cancelled, so it has "
+            "stopped checking. Your laptop watcher may still be running. Ask "
+            "Claude to redo the cloud sign-in.")
+        return
 
     topics = await resolve_topics(client)
     if not topics:

@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from telethon import TelegramClient, events, utils
+from telethon.errors import AuthKeyDuplicatedError, AuthKeyUnregisteredError
 from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
@@ -934,7 +935,15 @@ async def main() -> None:
         return
 
     client = TelegramClient(SESSION, API_ID, API_HASH)
-    await client.start()
+    try:
+        await client.start()
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+        log("TELEGRAM SIGN-IN CANCELLED — run first_time_login.py to sign in "
+            "again. (This happens if two watchers share one login.)")
+        notify(chat_id, "⚠️ The watcher on your laptop has stopped: its "
+                        "Telegram sign-in was cancelled. Ask Claude to sign "
+                        "in again.")
+        return
 
     # Attachments already passed on, so an album extra isn't sent twice
     forwarded = set()
